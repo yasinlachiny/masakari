@@ -1,101 +1,137 @@
-========
-Masakari
-========
+# Requirement
+1. key<br />
+At first  go to EC2 section and create key then store it in a safe place. This key is needed for accessng EC2 VMs.
 
-Virtual Machine High Availability (VMHA) service for OpenStack
+2. S3 role<br />
+Storing cloud_user_accessKeys in EC2 VMs is not safe so I should give EC2 instances a role that can access S3. For simplicity I give full access to S3.
 
-Masakari provides Virtual Machine High Availability (VMHA) service
-for OpenStack clouds by automatically recovering the KVM-based Virtual
-Machine(VM)s from failure events such as VM process down,
-provisioning process down, and nova-compute host failure.
-It also provides API service for manage and control the automated
-rescue mechanism.
+3. cloud_user_accessKeys<br />
+I want to update our code by Github so it should can access to our beanstalk by cloud_user_accessKeys.
 
-NOTE:
-Use masakari only if instance path is configured on shared storage system
-i.e, 'instances_path' config option of nova has a path of shared directory
-otherwise instance data will be lost after the evacuation of instance from
-failed host if,
-* instance is booted from image
-* flavor using ephemeral disks is used
-
-Original version of Masakari: https://github.com/ntt-sic/masakari
-
-Tokyo Summit Session: https://www.youtube.com/watch?v=BmjNKceW_9A
-
-Masakari is distributed under the terms of the Apache License,
-Version 2.0. The full terms and conditions of this license are
-detailed in the LICENSE file.
-
-* Free software: Apache license 2.0
-* Documentation: https://docs.openstack.org/masakari/latest
-* Source: https://git.openstack.org/cgit/openstack/masakari
-* Bugs: https://bugs.launchpad.net/masakari
-
-
-
-
+# Create Application
 #. Create masakari user:
+#. go to Elastic Beanstalk section and .
+#.choose proper application name
+#.in Platform choose PHP 7.4 running on 64bit Amazon Linux 2
+why this platform?
+ Amazon Linux 2 use nginx and  and PHP 7.3 have a bug in CICD.
 
-   .. code-block:: shell-session
+#.upload your code as zip file.
+#.Select Configure more options
 
-      openstack user create --password-prompt masakari
-      (give password as masakari)
+#.In Security Choose your EC2 key pair and IAM instance profile that you create in Requirement.
+#.In Database write proper username and password
+#.Select Create app
+#.It take a few minute to show final status
+#. ssh to EC2 VMs and Import a SQL file into the created DB
+```
+    aws s3 cp BACKUP.sql s3://BUCKET_NAME
+    mysql -u yasin -h DATABASE-URL -p ebdb < BACKUP.sql  
+```
+# Nginx
+Amazon Linux 1 (AL1) uses Apache2. However, Amazon Linux 2 (AL2) uses Nginx. After I use AL2 I get 404. 
+so how can I solve that?
+I should add bellow part to /etc/nginx/conf.d/elasticbeanstalk/php.conf
+```
+location / {
+     try_files $uri $uri/ /index.php?$query_string;
+         gzip_static on;
+}
+```
+I can add this after the VMs is created but I want to do it automatically so 
+I should create `.platform` and put the `php.conf` in `.platform/nginx/conf.d/elasticbeanstalk/php.conf`
 
-#. Add admin role to masakari user:
+# Copy .env from S3
+I want to download .env from s3. in Create Application we assign S3fullaccess role to EC2. so we can run S3 command without secret key or access key.
+so I create .ebextensions folder and  init.config file. In init.config I add 
+```
 
-   .. code-block:: shell-session
+container_commands:
+    02_get_env_vars:
+      command: aws s3 cp  s3://BUCKET-NAME/.env .
+```
+# composer install
+first I install composer and then I install dependencies. so I add this block to init.config
+```
+container_commands:
+    03-install-composer:
+      command: "curl -sS https://getcomposer.org/installer | php"
+    04-install-depenencies:
+      command: "composer.phar install --optimize-autoloader"
+```
+# php artisan and permissions
+for run php artisan I sould a this code to init.config
+```
+container_commands:
+    05-generate-key:
+      command: "php artisan key:generate"
+    06initdb:
+        command: "php artisan migrate"
+    07-link:
+      command: "php artisan storage:link"
+    08-add-permission:
+      command: "sudo chmod -R ug+rwx storage bootstrap/cache"
+```
+I can not run `sudo chgrp -R www-data storage bootstrap/cache` because there is no `www-data` group.
 
-      openstack role add --project service --user masakari admin
+# Setup a Supervisor
+firs I should add bellow code to init.config
+```
+container_commands:
+    01-copy_systemd_file:
+      command: "easy_install supervisor"
+    02-enable_systemd:
+      command: "mkdir -p /etc/supervisor/conf.d"
+    03-copy_laravel-worker_config:
+      command: "cp .ebextensions/laravel-worker.conf /etc/supervisor/conf.d/laravel-worker.conf"
+    04-copy_supervidor_config:
+      command: "cp .ebextensions/supervisord.conf /etc/supervisord.conf"
+    05-touch_log:
+      command: "mkdir -p /var/log/supervisor/ && touch /var/log/supervisor/supervisord.log"
+```
+and create laravel-worker.conf in .ebextensions 
+```[program:laravel-worker]
+process_name=%(program_name)s_%(process_num)02d
+command=php /var/www/html/artisan queue:work --tries=3
+autostart=true
+autorestart=true
+user=root
+numprocs=5
+redirect_stderr=true
+stdout_logfile=/var/www/html/storage/logs/worker.log
+```
+I can not run `/bin/supervisord -c /etc/supervisord.conf` by `container_commands` or `commands`
+because I should run it after deployment. It has diffrent way in AL2 so be careful.
+I should create `.platform/hooks/postdeploy` directory and add 01_Supervisor.sh file. and in 01_Supervisor.sh I can run  `/bin/supervisord -c /etc/supervisord.conf`
+```
+#!/usr/bin/env bash
+touch /var/www/1.log
+/bin/supervisord -c /etc/supervisord.conf
+```
+But after I launch this code I get permission denied error. so I should run `chmod +x .platform/hooks/postdeploy/01_Supervisor.sh`
+and after that the error is disaper.
 
-#. Create new service:
 
-   .. code-block:: shell-session
+# Add a Cron entry
+There are a lot of way to do that but I do it by add bellow code to init.config
+```
+container_commands:
+    01_remove_old_cron_jobs:
+      command: "crontab -r || exit 0"
+    02_cronjobs:
+      command: "cat .ebextensions/crontab | crontab"
+      leader_only: true
+```
+and add cron file to .ebextensions.
+* * * * * php /var/www/medvoice/artisan schedule:run >> /dev/null 2>&1
+ The important part is adding new empty line at the end of cron file.
+# CI/CD
+create .github/workflows/ folder and add php.yml. in add.yml I can deploy a code and say what I want to do
+forexample I can create bellow part and get timestamp and use it as  version_label(version_label: "${{ steps.timestamp.outputs.date}}")
+```
+    - name: Get timestamp
+      id: timestamp
+      run: echo "::set-output name=date::$(date +'%Y-%m-%dT%H-%M-%S-%3NZ')"
+```
 
-      openstack service create --name masakari --description "masakari high availability" instance-ha
-
-#. Create endpoint for masakari service:
-
-   .. code-block:: shell-session
-
-      openstack endpoint create --region RegionOne masakari --publicurl http://<ip-address>:<port>/v1/%\(tenant_id\)s --adminurl http://<ip-address>:<port>/v1/%\(tenant_id\)s --internalurl http://<ip-address>:<port>/v1/%\(tenant_id\)s
-
-#. Clone masakari using
-
-   .. code-block:: shell-session
-
-      git clone https://github.com/openstack/masakari.git
-
-#. Run setup.py from masakari
-
-   .. code-block:: shell-session
-
-      sudo python setup.py install
-
-#. Create directory ``/etc/masakari``
-
-#. Copy ``masakari.conf``, ``api-paste.ini`` and ``policy.json`` file
-   from ``masakari/etc/`` to ``/etc/masakari`` folder
-
-#. To run masakari-api simply use following binary:
-
-   .. code-block:: shell-session
-
-      masakari-api
-
-Configure masakari database
----------------------------
-
-#. Create 'masakari' database
-
-#. After running setup.py for masakari (``sudo python setup.py install``),
-   run ``masakari-manage`` command to sync the database
-
-   .. code-block:: shell-session
-
-      masakari-manage db sync
-
-Features
---------
-
-* TODO
+![alt text](https://github.com/adam-p/markdown-here/raw/master/src/common/images/icon48.png "Logo Title Text 1")
