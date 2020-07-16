@@ -33,8 +33,7 @@ detailed in the LICENSE file.
 * Bugs: https://bugs.launchpad.net/masakari
 
 
-Configure masakari-api
-----------------------
+
 
 #. Create masakari user:
 
